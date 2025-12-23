@@ -6,21 +6,18 @@ pragma solidity ^0.8.25;
  * @notice Uses EIP-7885 NTT precompiles instead of pure Solidity NTT implementations
  */
 
-import {console} from "forge-std/Test.sol";
-
 import {PrecompileNTT} from "./precompile_NTT.sol";
-import "./ZKNOX_shake.sol";
 import {
     q,
-    ZKNOX_Expand,
-    ZKNOX_Expand_Vec,
-    ZKNOX_Expand_Mat,
+    expand,
+    expandVec,
+    expandMat,
     bitUnpackAtOffset,
-    omega,
+    OMEGA,
     k,
     l,
     n,
-    gamma_1,
+    GAMMA_1,
     Signature,
     PubKey
 } from "./ZKNOX_dilithium_utils.sol";
@@ -72,7 +69,7 @@ function PRECOMPILE_MatVecProductDilithium(uint256[][][] memory M, uint256[][] m
 }
 
 function precompile_unpack_h(bytes memory hBytes) pure returns (bool success, uint256[][] memory h) {
-    require(hBytes.length >= omega + k, "Invalid h bytes length");
+    require(hBytes.length >= OMEGA + k, "Invalid h bytes length");
 
     uint256 k_idx = 0;
 
@@ -83,10 +80,10 @@ function precompile_unpack_h(bytes memory hBytes) pure returns (bool success, ui
             h[i][j] = 0;
         }
 
-        uint256 omegaVal = uint8(hBytes[omega + i]);
+        uint256 omegaVal = uint8(hBytes[OMEGA + i]);
 
         // Check bound on omegaVal
-        if (omegaVal < k_idx || omegaVal > omega) {
+        if (omegaVal < k_idx || omegaVal > OMEGA) {
             return (false, h);
         }
 
@@ -109,7 +106,7 @@ function precompile_unpack_h(bytes memory hBytes) pure returns (bool success, ui
     }
 
     // Check extra indices are zero
-    for (uint256 j = k_idx; j < omega; j++) {
+    for (uint256 j = k_idx; j < OMEGA; j++) {
         if (uint8(hBytes[j]) != 0) {
             return (false, h);
         }
@@ -123,16 +120,16 @@ function precompile_unpack_z(bytes memory inputBytes) pure returns (uint256[][] 
     uint256 requiredBytes;
 
     // Level 2 parameter set
-    if (gamma_1 == (1 << 17)) {
+    if (GAMMA_1 == (1 << 17)) {
         coeffBits = 18;
         requiredBytes = (n * l * 18) / 8; // Total bytes for all polynomials
     }
     // Level 3 and 5 parameter set
-    else if (gamma_1 == (1 << 19)) {
+    else if (GAMMA_1 == (1 << 19)) {
         coeffBits = 20;
         requiredBytes = (n * l * 20) / 8; // Total bytes for all polynomials
     } else {
-        revert("gamma_1 must be either 2^17 or 2^19");
+        revert("GAMMA_1 must be either 2^17 or 2^19");
     }
 
     require(inputBytes.length >= requiredBytes, "Insufficient data");
@@ -146,13 +143,13 @@ function precompile_unpack_z(bytes memory inputBytes) pure returns (uint256[][] 
         // Unpack the altered coefficients for polynomial i
         uint256[] memory alteredCoeffs = bitUnpackAtOffset(inputBytes, coeffBits, bitOffset, n);
 
-        // Compute coefficients as gamma_1 - c
+        // Compute coefficients as GAMMA_1 - c
         coefficients[i] = new uint256[](n);
         for (uint256 j = 0; j < n; j++) {
-            if (alteredCoeffs[j] < gamma_1) {
-                coefficients[i][j] = gamma_1 - alteredCoeffs[j];
+            if (alteredCoeffs[j] < GAMMA_1) {
+                coefficients[i][j] = GAMMA_1 - alteredCoeffs[j];
             } else {
-                coefficients[i][j] = q + gamma_1 - alteredCoeffs[j];
+                coefficients[i][j] = q + GAMMA_1 - alteredCoeffs[j];
             }
         }
 
@@ -163,18 +160,18 @@ function precompile_unpack_z(bytes memory inputBytes) pure returns (uint256[][] 
     return coefficients;
 }
 
-function precompile_dilithium_core_1(Signature memory signature)
+function precompileDilithiumCore1(Signature memory signature)
     pure
-    returns (bool foo, uint256 norm_h, uint256[][] memory h, uint256[][] memory z)
+    returns (bool foo, uint256 normH, uint256[][] memory h, uint256[][] memory z)
 {
     (foo, h) = precompile_unpack_h(signature.h);
     uint256 i;
     uint256 j;
-    norm_h = 0;
+    normH = 0;
     for (i = 0; i < 4; i++) {
         for (j = 0; j < 256; j++) {
             if (h[i][j] == 1) {
-                norm_h += 1;
+                normH += 1;
             }
         }
     }
@@ -182,34 +179,34 @@ function precompile_dilithium_core_1(Signature memory signature)
     z = precompile_unpack_z(signature.z);
 }
 
-function precompile_dilithium_core_2(
+function precompileDilithiumCore2(
     PubKey memory pk,
     uint256[][] memory z,
-    uint256[] memory c_ntt,
+    uint256[] memory cNtt,
     uint256[][] memory h,
-    uint256[][] memory t1_new
-) view returns (bytes memory w_prime_bytes) {
+    uint256[][] memory t1New
+) view returns (bytes memory wPrimeBytes) {
     // NTT(z) using precompile
     for (uint256 i = 0; i < 4; i++) {
         z[i] = PrecompileNTT.PRECOMPILE_NTTFW(z[i]);
     }
 
     // 1. A*z using precompile-based matrix-vector product
-    uint256[][][] memory A_hat = ZKNOX_Expand_Mat(pk.a_hat);
+    uint256[][][] memory A_hat = expandMat(pk.aHat);
     z = PRECOMPILE_MatVecProductDilithium(A_hat, z);
 
     // 2. A*z - c*t1 using precompile operations
     for (uint256 i = 0; i < 4; i++) {
         // c*t1 using precompile VECMULMOD
-        uint256[] memory ct1 = PrecompileNTT.PRECOMPILE_VECMULMOD(t1_new[i], c_ntt);
+        uint256[] memory ct1 = PrecompileNTT.PRECOMPILE_VECMULMOD(t1New[i], cNtt);
         // z - c*t1
         uint256[] memory diff = PRECOMPILE_VECSUBMOD(z[i], ct1);
         // Inverse NTT using precompile
         z[i] = PrecompileNTT.PRECOMPILE_NTTINV(diff);
     }
 
-    // 3. w_prime packed using a "solidity-friendly encoding"
-    w_prime_bytes = useHintDilithium(h, z);
+    // 3. wPrimeBytes packed using a "solidity-friendly encoding"
+    wPrimeBytes = useHintDilithium(h, z);
 }
 
 // ============================================================================
@@ -279,7 +276,7 @@ function precompile_dilithium_core_2_optimized(
     }
 
     // 2. A * NTT(z) using compact A and bytes z
-    bytes[] memory Az_bytes = PRECOMPILE_MatVecProductDilithium_Bytes(pk.a_hat, z_ntt_bytes);
+    bytes[] memory Az_bytes = PRECOMPILE_MatVecProductDilithium_Bytes(pk.aHat, z_ntt_bytes);
 
     // 3. NTT(c), then c * t1 and subtract from Az
     // c_compact is challenge in standard domain (NOT NTT), apply NTT here
@@ -363,10 +360,10 @@ function precompile_unpack_z_to_bytes_with_check(bytes memory inputBytes)
     pure
     returns (bool valid, bytes[4] memory z_bytes)
 {
-    // Level 2: coeffBits = 18, gamma_1 = 2^17
-    // Level 3/5: coeffBits = 20, gamma_1 = 2^19
-    uint256 coeffBits = (gamma_1 == (1 << 17)) ? 18 : 20;
-    uint256 gamma1_minus_beta = 130994; // gamma_1 - tau * eta
+    // Level 2: coeffBits = 18, GAMMA_1 = 2^17
+    // Level 3/5: coeffBits = 20, GAMMA_1 = 2^19
+    uint256 coeffBits = (GAMMA_1 == (1 << 17)) ? 18 : 20;
+    uint256 gamma1_minus_beta = 130994; // GAMMA_1 - tau * eta
 
     valid = true;
 
@@ -496,7 +493,7 @@ function precompile_dilithium_core_2_bytes(
     }
 
     // 2. A * NTT(z) using compact A and bytes z
-    bytes[] memory Az_bytes = PRECOMPILE_MatVecProductDilithium_Bytes(pk.a_hat, z_ntt_bytes);
+    bytes[] memory Az_bytes = PRECOMPILE_MatVecProductDilithium_Bytes(pk.aHat, z_ntt_bytes);
 
     // 3. NTT(c), then c * t1 and subtract from Az
     // c_compact is challenge in standard domain (NOT NTT), apply NTT here

@@ -32,35 +32,22 @@
 ///* See LICENSE file at the root folder of the project.
 ///* FILE: precompile_ethdilithium.sol
 ///* Description: Compute ethereum friendly version of dilithium verification using EIP-7885 NTT precompiles
-/**
- *
- */
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.25;
 
 import {PrecompileNTT} from "./precompile_NTT.sol";
 import {
-    precompile_dilithium_core_1,
-    precompile_dilithium_core_2,
+    precompileDilithiumCore1,
+    precompileDilithiumCore2,
     precompile_dilithium_core_2_optimized,
     precompile_dilithium_core_1_bytes,
     precompile_dilithium_core_2_bytes
 } from "./precompile_dilithium_core.sol";
-import "./ZKNOX_dilithium_utils.sol";
-import "./ZKNOX_SampleInBall.sol";
-import "./ZKNOX_shake.sol";
-import {
-    q,
-    ZKNOX_Expand,
-    ZKNOX_Expand_Vec,
-    ZKNOX_Expand_Mat,
-    ZKNOX_Compact,
-    omega,
-    gamma_1_minus_beta
-} from "./ZKNOX_dilithium_utils.sol";
-import {console} from "forge-std/Test.sol";
-
-import {useHintDilithium} from "./ZKNOX_hint.sol";
+import {sampleInBallKeccakPrng} from "./ZKNOX_SampleInBall.sol";
+import {KeccakPrng, initPrng, refill} from "./ZKNOX_keccak_prng.sol";
+import {q, expandVec, compact, OMEGA, GAMMA_1_MINUS_BETA, TAU, PubKey, Signature, slice} from "./ZKNOX_dilithium_utils.sol";
+import {IERC7913SignatureVerifier} from "@openzeppelin/contracts/interfaces/IERC7913.sol";
+import {IPKContract} from "./ZKNOX_PKContract.sol";
 
 /**
  * @title Precompile-based ETH Dilithium Verification Contract
@@ -71,41 +58,55 @@ import {useHintDilithium} from "./ZKNOX_hint.sol";
  *      - 0x14: NTT_VECMULMOD (Vector modular multiplication)
  *      - 0x15: NTT_VECADDMOD (Vector modular addition)
  */
-contract precompile_ethdilithium {
-    /**
-     * @notice Verify a Dilithium signature
-     * @param pk Public key
-     * @param m Message bytes
-     * @param signature Signature to verify
-     * @param ctx Context bytes (must be <= 255 bytes)
-     * @return True if signature is valid
-     */
-    function verify(PubKey memory pk, bytes memory m, Signature memory signature, bytes memory ctx)
+contract precompile_ethdilithium is IERC7913SignatureVerifier {
+    function verify(bytes memory pk, bytes memory m, bytes memory signature, bytes memory ctx)
         external
         view
         returns (bool)
     {
+        // Fetch the public key from the address `pk`
+        address pubKeyAddress;
+        assembly {
+            pubKeyAddress := mload(add(pk, 20))
+        }
+        PubKey memory publicKey = IPKContract(pubKeyAddress).getPublicKey();
+
         // Step 1: check ctx length
         if (ctx.length > 255) {
             revert("ctx bytes must have length at most 255");
         }
 
-        // Step 2: m_prime = 0x00 || len(ctx) || ctx || m
-        bytes memory m_prime = abi.encodePacked(bytes1(0), bytes1(uint8(ctx.length)), ctx, m);
+        // Step 2: mPrime = 0x00 || len(ctx) || ctx || m
+        bytes memory mPrime = abi.encodePacked(bytes1(0), bytes1(uint8(ctx.length)), ctx, m);
+
+        Signature memory sig =
+            Signature({cTilde: slice(signature, 0, 32), z: slice(signature, 32, 2304), h: slice(signature, 2336, 84)});
 
         // Step 3: delegate to internal verify
-        return verify_internal(pk, m_prime, signature);
+        return verifyInternal(publicKey, mPrime, sig);
     }
 
-    /**
-     * @notice Internal verification logic using precompiles (LEGACY)
-     * @dev Uses expand/compact cycles - kept for compatibility
-     * @param pk Public key
-     * @param m_prime Processed message
-     * @param signature Signature to verify
-     * @return True if signature is valid
-     */
-    function verify_internal(PubKey memory pk, bytes memory m_prime, Signature memory signature)
+    function verify(bytes calldata pk, bytes32 m, bytes calldata signature) external view returns (bytes4) {
+        // Fetch the public key from the address `pk`
+        address pubKeyAddress;
+        assembly {
+            pubKeyAddress := shr(96, calldataload(pk.offset))
+        }
+        PubKey memory publicKey = IPKContract(pubKeyAddress).getPublicKey();
+
+        bytes memory mPrime = abi.encodePacked(bytes1(0), bytes1(0), m);
+
+        Signature memory sig =
+            Signature({cTilde: slice(signature, 0, 32), z: slice(signature, 32, 2304), h: slice(signature, 2336, 84)});
+
+        // Step 3: delegate to internal verify
+        if (verifyInternal(publicKey, mPrime, sig)) {
+            return IERC7913SignatureVerifier.verify.selector;
+        }
+        return 0xFFFFFFFF;
+    }
+
+    function verifyInternal(PubKey memory pk, bytes memory mPrime, Signature memory signature)
         internal
         view
         returns (bool)
@@ -114,104 +115,73 @@ contract precompile_ethdilithium {
         uint256 j;
 
         // FIRST CORE STEP
-        (bool foo, uint256 norm_h, uint256[][] memory h, uint256[][] memory z) = precompile_dilithium_core_1(signature);
+        (bool foo, uint256 normH, uint256[][] memory h, uint256[][] memory z) = precompileDilithiumCore1(signature);
 
         if (foo == false) {
             return false;
         }
-        if (norm_h > omega) {
+        if (normH > OMEGA) {
             return false;
         }
         for (i = 0; i < 4; i++) {
             for (j = 0; j < 256; j++) {
                 uint256 zij = z[i][j];
-                if (zij > gamma_1_minus_beta && (q - zij) > gamma_1_minus_beta) {
+                if (zij > GAMMA_1_MINUS_BETA && (q - zij) > GAMMA_1_MINUS_BETA) {
                     return false;
                 }
             }
         }
 
         // C_NTT - using precompile for forward NTT
-        uint256[] memory c_ntt = sampleInBallKeccakPRNG(signature.c_tilde, tau, q);
-        c_ntt = PrecompileNTT.PRECOMPILE_NTTFW(c_ntt);
+        uint256[] memory cNtt = sampleInBallKeccakPrng(signature.cTilde, TAU, q);
+        cNtt = PrecompileNTT.PRECOMPILE_NTTFW(cNtt);
 
-        // t1_new
-        uint256[][] memory t1_new = ZKNOX_Expand_Vec(pk.t1);
+        // t1New
+        uint256[][] memory t1New = expandVec(pk.t1);
 
         // SECOND CORE STEP using precompiles
-        bytes memory w_prime_bytes = precompile_dilithium_core_2(pk, z, c_ntt, h, t1_new);
+        bytes memory wPrimeBytes = precompileDilithiumCore2(pk, z, cNtt, h, t1New);
 
         // FINAL HASH
-        KeccakPRNG memory prng = initPRNG(abi.encodePacked(pk.tr, m_prime));
+        KeccakPrng memory prng = initPrng(abi.encodePacked(pk.tr, mPrime));
         bytes32 out1 = prng.pool;
         refill(prng);
         bytes32 out2 = prng.pool;
-        prng = initPRNG(abi.encodePacked(out1, out2, w_prime_bytes));
-        bytes32 final_hash = prng.pool;
-        return final_hash == bytes32(signature.c_tilde);
+        prng = initPrng(abi.encodePacked(out1, out2, wPrimeBytes));
+        bytes32 finalHash = prng.pool;
+        return finalHash == bytes32(signature.cTilde);
     }
 
+    // ============================================================================
+    // LEGACY & OPTIMIZED VERIFICATION FUNCTIONS
+    // ============================================================================
+
     /**
-     * @notice Optimized internal verification using bytes-based operations
-     * @dev Eliminates expand/compact cycles for significant gas savings
-     *      Uses compact format directly with precompiles
-     * @param pk Public key (with compact t1 and a_hat)
-     * @param m_prime Processed message
-     * @param signature Signature to verify
+     * @notice Legacy verify - accepts PubKey and Signature structs directly
+     * @param pk Public key struct
+     * @param m Message bytes
+     * @param signature Signature struct
+     * @param ctx Context bytes (must be <= 255 bytes)
      * @return True if signature is valid
      */
-    function verify_internal_optimized(PubKey memory pk, bytes memory m_prime, Signature memory signature)
-        internal
+    function verifyLegacy(PubKey memory pk, bytes memory m, Signature memory signature, bytes memory ctx)
+        external
         view
         returns (bool)
     {
-        uint256 i;
-        uint256 j;
-
-        // FIRST CORE STEP - unpack signature components
-        (bool foo, uint256 norm_h, uint256[][] memory h, uint256[][] memory z) = precompile_dilithium_core_1(signature);
-
-        if (foo == false) {
-            return false;
+        if (ctx.length > 255) {
+            revert("ctx bytes must have length at most 255");
         }
-        if (norm_h > omega) {
-            return false;
-        }
-
-        // Check z norm bounds
-        for (i = 0; i < 4; i++) {
-            for (j = 0; j < 256; j++) {
-                uint256 zij = z[i][j];
-                if (zij > gamma_1_minus_beta && (q - zij) > gamma_1_minus_beta) {
-                    return false;
-                }
-            }
-        }
-
-        // C - sample challenge (NOT yet NTT transformed)
-        // NTT will be applied inside core_2_optimized
-        uint256[] memory c = sampleInBallKeccakPRNG(signature.c_tilde, tau, q);
-        uint256[] memory c_compact = ZKNOX_Compact(c);
-
-        // SECOND CORE STEP using optimized bytes-based operations
-        // Note: pk.t1 and pk.a_hat are already in compact NTT domain
-        bytes memory w_prime_bytes = precompile_dilithium_core_2_optimized(pk, z, c_compact, h);
-
-        // FINAL HASH
-        KeccakPRNG memory prng = initPRNG(abi.encodePacked(pk.tr, m_prime));
-        bytes32 out1 = prng.pool;
-        refill(prng);
-        bytes32 out2 = prng.pool;
-        prng = initPRNG(abi.encodePacked(out1, out2, w_prime_bytes));
-        bytes32 final_hash = prng.pool;
-        return final_hash == bytes32(signature.c_tilde);
+        bytes memory mPrime = abi.encodePacked(bytes1(0), bytes1(uint8(ctx.length)), ctx, m);
+        return verifyInternal(pk, mPrime, signature);
     }
 
     /**
-     * @notice Verify a Dilithium signature using optimized bytes-based operations
-     * @param pk Public key
+     * @notice Optimized verify using precompile_dilithium_core_2_optimized
+     * @dev Uses bytes-based operations internally to avoid expand/compact cycles
+     * @param pk Public key struct
      * @param m Message bytes
-     * @param signature Signature to verify
+     * @param signature Signature struct
      * @param ctx Context bytes (must be <= 255 bytes)
      * @return True if signature is valid
      */
@@ -220,102 +190,19 @@ contract precompile_ethdilithium {
         view
         returns (bool)
     {
-        // Step 1: check ctx length
         if (ctx.length > 255) {
             revert("ctx bytes must have length at most 255");
         }
-
-        // Step 2: m_prime = 0x00 || len(ctx) || ctx || m
-        bytes memory m_prime = abi.encodePacked(bytes1(0), bytes1(uint8(ctx.length)), ctx, m);
-
-        // Step 3: delegate to optimized internal verify
-        return verify_internal_optimized(pk, m_prime, signature);
+        bytes memory mPrime = abi.encodePacked(bytes1(0), bytes1(uint8(ctx.length)), ctx, m);
+        return verifyInternalOptimized(pk, mPrime, signature);
     }
 
     /**
-     * @notice Legacy verify function (kept for compatibility)
-     * @dev Uses original expand/compact cycles
-     */
-    function verifyLegacy(PubKey memory pk, bytes memory m, Signature memory signature, bytes memory ctx)
-        external
-        view
-        returns (bool)
-    {
-        // Step 1: check ctx length
-        if (ctx.length > 255) {
-            revert("ctx bytes must have length at most 255");
-        }
-
-        // Step 2: m_prime = 0x00 || len(ctx) || ctx || m
-        bytes memory m_prime = abi.encodePacked(bytes1(0), bytes1(uint8(ctx.length)), ctx, m);
-
-        // Step 3: delegate to legacy internal verify
-        return verify_internal(pk, m_prime, signature);
-    }
-
-    /**
-     * @notice Ultra-optimized verification using bytes-based z processing
-     * @dev Unpacks z directly to bytes format,
-     *      eliminating uint256[][] intermediate storage (saves ~28KB memory)
-     *
-     * Gas optimization breakdown:
-     * - Eliminates 4×256×32 = 32KB z array allocation
-     * - Removes _encodeExpandedToBytes conversion
-     * - Single-pass unpack with integrated norm check
-     *
-     * @param pk Public key (t1 must be pre-computed as NTT(t1 << d))
-     * @param m_prime Processed message
-     * @param signature Signature to verify
-     * @return True if signature is valid
-     */
-    function verify_internal_bytes_optimized(PubKey memory pk, bytes memory m_prime, Signature memory signature)
-        internal
-        view
-        returns (bool)
-    {
-        // FIRST CORE STEP - unpack with bytes-based z and integrated norm check
-        (bool h_valid, uint256 norm_h, uint256[][] memory h, bool z_valid, bytes[4] memory z_bytes) =
-            precompile_dilithium_core_1_bytes(signature);
-
-        // Validate h unpacking
-        if (!h_valid) {
-            return false;
-        }
-        if (norm_h > omega) {
-            return false;
-        }
-
-        // z norm check was done during unpacking
-        if (!z_valid) {
-            return false;
-        }
-
-        // C - sample challenge (NOT yet NTT transformed)
-        // NTT will be applied inside core_2_bytes
-        uint256[] memory c = sampleInBallKeccakPRNG(signature.c_tilde, tau, q);
-        uint256[] memory c_compact = ZKNOX_Compact(c);
-
-        // SECOND CORE STEP using bytes-based z
-        // Note: pk.t1 must contain NTT(t1 << d) in compact form
-        bytes memory w_prime_bytes = precompile_dilithium_core_2_bytes(pk, z_bytes, c_compact, h);
-
-        // FINAL HASH
-        KeccakPRNG memory prng = initPRNG(abi.encodePacked(pk.tr, m_prime));
-        bytes32 out1 = prng.pool;
-        refill(prng);
-        bytes32 out2 = prng.pool;
-        prng = initPRNG(abi.encodePacked(out1, out2, w_prime_bytes));
-        bytes32 final_hash = prng.pool;
-        return final_hash == bytes32(signature.c_tilde);
-    }
-
-    /**
-     * @notice Verify with bytes-based z optimization
-     * @dev Most gas-efficient verification method
-     *      Requires pk.t1 = NTT(t1 << d) pre-computed
-     * @param pk Public key
+     * @notice Bytes-optimized verify using bytes-based core functions
+     * @dev Maximum optimization - avoids most expand/compact conversions
+     * @param pk Public key struct
      * @param m Message bytes
-     * @param signature Signature to verify
+     * @param signature Signature struct
      * @param ctx Context bytes (must be <= 255 bytes)
      * @return True if signature is valid
      */
@@ -324,15 +211,96 @@ contract precompile_ethdilithium {
         view
         returns (bool)
     {
-        // Step 1: check ctx length
         if (ctx.length > 255) {
             revert("ctx bytes must have length at most 255");
         }
+        bytes memory mPrime = abi.encodePacked(bytes1(0), bytes1(uint8(ctx.length)), ctx, m);
+        return verifyInternalBytesOptimized(pk, mPrime, signature);
+    }
 
-        // Step 2: m_prime = 0x00 || len(ctx) || ctx || m
-        bytes memory m_prime = abi.encodePacked(bytes1(0), bytes1(uint8(ctx.length)), ctx, m);
+    /**
+     * @notice Internal optimized verification using precompile_dilithium_core_2_optimized
+     */
+    function verifyInternalOptimized(PubKey memory pk, bytes memory mPrime, Signature memory signature)
+        internal
+        view
+        returns (bool)
+    {
+        uint256 i;
+        uint256 j;
 
-        // Step 3: delegate to bytes-optimized internal verify
-        return verify_internal_bytes_optimized(pk, m_prime, signature);
+        // FIRST CORE STEP (same as basic version)
+        (bool foo, uint256 normH, uint256[][] memory h, uint256[][] memory z) = precompileDilithiumCore1(signature);
+
+        if (foo == false) {
+            return false;
+        }
+        if (normH > OMEGA) {
+            return false;
+        }
+        for (i = 0; i < 4; i++) {
+            for (j = 0; j < 256; j++) {
+                uint256 zij = z[i][j];
+                if (zij > GAMMA_1_MINUS_BETA && (q - zij) > GAMMA_1_MINUS_BETA) {
+                    return false;
+                }
+            }
+        }
+
+        // C_NTT - sample and keep as compact for optimized core
+        uint256[] memory cExpanded = sampleInBallKeccakPrng(signature.cTilde, TAU, q);
+        uint256[] memory cCompact = compact(cExpanded);
+
+        // SECOND CORE STEP - optimized version
+        bytes memory wPrimeBytes = precompile_dilithium_core_2_optimized(pk, z, cCompact, h);
+
+        // FINAL HASH
+        KeccakPrng memory prng = initPrng(abi.encodePacked(pk.tr, mPrime));
+        bytes32 out1 = prng.pool;
+        refill(prng);
+        bytes32 out2 = prng.pool;
+        prng = initPrng(abi.encodePacked(out1, out2, wPrimeBytes));
+        bytes32 finalHash = prng.pool;
+        return finalHash == bytes32(signature.cTilde);
+    }
+
+    /**
+     * @notice Internal bytes-optimized verification
+     * @dev Uses precompile_dilithium_core_1_bytes and precompile_dilithium_core_2_bytes
+     */
+    function verifyInternalBytesOptimized(PubKey memory pk, bytes memory mPrime, Signature memory signature)
+        internal
+        view
+        returns (bool)
+    {
+        // FIRST CORE STEP - bytes version with integrated norm check
+        (bool foo, uint256 normH, uint256[][] memory h, bool zValid, bytes[4] memory zBytes) =
+            precompile_dilithium_core_1_bytes(signature);
+
+        if (foo == false) {
+            return false;
+        }
+        if (normH > OMEGA) {
+            return false;
+        }
+        if (zValid == false) {
+            return false;
+        }
+
+        // C_NTT - sample and keep as compact
+        uint256[] memory cExpanded = sampleInBallKeccakPrng(signature.cTilde, TAU, q);
+        uint256[] memory cCompact = compact(cExpanded);
+
+        // SECOND CORE STEP - bytes version
+        bytes memory wPrimeBytes = precompile_dilithium_core_2_bytes(pk, zBytes, cCompact, h);
+
+        // FINAL HASH
+        KeccakPrng memory prng = initPrng(abi.encodePacked(pk.tr, mPrime));
+        bytes32 out1 = prng.pool;
+        refill(prng);
+        bytes32 out2 = prng.pool;
+        prng = initPrng(abi.encodePacked(out1, out2, wPrimeBytes));
+        bytes32 finalHash = prng.pool;
+        return finalHash == bytes32(signature.cTilde);
     }
 }
