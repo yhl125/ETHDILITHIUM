@@ -24,7 +24,7 @@ contract Script_Deploy_Precompile_ETHDilithium is BaseScript {
     function run() external {
         vm.startBroadcast();
 
-        bytes32 salty = keccak256(abi.encodePacked("ZKNOX_precompile_v0.2"));
+        bytes32 salty = keccak256(abi.encodePacked("ZKNOX_precompile_v0.4"));
 
         precompile_ethdilithium ETHDILITHIUM = new precompile_ethdilithium{salt: salty}();
 
