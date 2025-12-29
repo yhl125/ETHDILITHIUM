@@ -118,6 +118,26 @@ contract precompile_ethdilithium is IERC7913SignatureVerifier {
     }
 
     /**
+     * @notice Verify a Dilithium signature (direct struct input)
+     * @param pk Public key struct
+     * @param m Message bytes
+     * @param signature Signature struct
+     * @param ctx Context bytes (must be <= 255 bytes)
+     * @return True if signature is valid
+     */
+    function verify(PubKey memory pk, bytes memory m, Signature memory signature, bytes memory ctx)
+        external
+        view
+        returns (bool)
+    {
+        if (ctx.length > 255) {
+            revert("ctx bytes must have length at most 255");
+        }
+        bytes memory mPrime = abi.encodePacked(bytes1(0), bytes1(uint8(ctx.length)), ctx, m);
+        return verifyInternal(pk, mPrime, signature);
+    }
+
+    /**
      * @notice Internal bytes-optimized verification
      * @dev Uses precompile_dilithium_core_1_bytes and precompile_dilithium_core_2_bytes
      *      Maximum optimization - avoids most expand/compact conversions
